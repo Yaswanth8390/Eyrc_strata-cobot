@@ -31,6 +31,7 @@
 
 ################### IMPORT MODULES #######################
 
+from matplotlib import image
 import rclpy
 import sys
 import cv2
@@ -41,7 +42,8 @@ from rclpy.node import Node
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
-
+from tf2_geometry_msgs import do_transform_point
+from geometry_msgs.msg import PointStamped
 
 ##################### TASK CONSTANTS #######################
 
@@ -52,6 +54,20 @@ ore_types = ['azurite_ore', 'malachite_ore', 'vanadinite_ore']
 color_topic = '/camera/camera/color/image_raw'
 depth_topic = '/camera/camera/aligned_depth_to_color/image_raw'
 camera_info_topic = '/camera/camera/color/camera_info'
+COLOR_DETECTION_DICT = {
+    'vanadinite_ore': {
+        'lower': np.array([0, 180, 180]),
+        'upper': np.array([17, 255, 255])
+    },
+    'azurite_ore': {
+        'lower': np.array([100, 20, 30]),
+        'upper': np.array([140, 255, 255])
+    },
+    'malachite_ore': {
+        'lower': np.array([60, 150, 140]),
+        'upper': np.array([75, 255, 255])
+    }
+}
 
 # The parent frame every ore transform is published against.
 base_frame = 'base_link'
@@ -80,6 +96,35 @@ def detect_ores(image):
     ore_type_list = []
 
     ############ ADD YOUR CODE HERE ############
+    hsv  = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    ore_id_counter = {name: 0 for name in COLOR_DETECTION_DICT} 
+    for color_name, bounds in COLOR_DETECTION_DICT.items():
+        mask = cv2.inRange(hsv, bounds['lower'], bounds['upper'])
+
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
+        cleaned_mask = cv2.morphologyEx (mask,cv2.MORPH_OPEN,open_kernel)
+        final_mask = cv2.morphologyEx(cleaned_mask  , cv2.MORPH_CLOSE, close_kernel)
+
+        contour,hierarcy = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cont in contour:
+            if cv2.contourArea(cont) < 120:
+                continue
+            M = cv2.moments(cont)
+            cX = int(M['m10'] / M['m00'])
+            cY = int(M['m01'] / M['m00'])
+            ore_id_counter[color_name] += 1
+            ore_label = f'{color_name}_{ore_id_counter[color_name]}'
+            
+            x, y, w, h = cv2.boundingRect(cont)
+            cv2.rectangle(image, (x, y), (x+w, y+h), (0, 255, 255), 2)
+            cv2.circle(image, (cX, cY), 5, (0, 0, 255), -1)
+            cv2.putText(image, color_name, (x, y-5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.imwrite("detected_ores.jpg", image)
+            center_ore_list.append((cX, cY))
+            ore_type_list.append(color_name)
 
     # INSTRUCTIONS & HELP :
 
@@ -142,10 +187,10 @@ class ore_tf(Node):
         self.depth_image = None                                                         # depth image variable (from depthimagecb())
         self.cam_info = None                                                            # camera intrinsics variable (from caminfocb())
 
+
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
-
         #	->  Add any variable your detection needs to keep between frames.
         #       ->  HINT: The two ores of a type must keep their ids for the whole run, and
         #                 'detect_ores' returns them unordered.
@@ -164,6 +209,10 @@ class ore_tf(Node):
         Returns:
         '''
 
+        self.depth_image = self.bridge.imgmsg_to_cv2(data, desired_encoding='passthrough')
+        # print(self.depth_image.dtype)
+        if self.depth_image is None:
+            return
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
@@ -190,7 +239,10 @@ class ore_tf(Node):
 
         Returns:
         '''
+        self.cv_image = self.bridge.imgmsg_to_cv2(data, desired_encoding='bgr8')
 
+        if self.cv_image is None:
+            return
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
@@ -211,7 +263,7 @@ class ore_tf(Node):
 
         Returns:
         '''
-
+        self.cam_info = data
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
@@ -220,7 +272,10 @@ class ore_tf(Node):
         #       never hard-code them.
         #       ->  HINT: 'k' is the pinhole matrix flattened row by row-
         #                     k = [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-
+        self.fx = data.k[0]
+        self.fy = data.k[4]
+        self.cx = data.k[2]
+        self.cy = data.k[5]
         ############################################
 
 
@@ -234,7 +289,47 @@ class ore_tf(Node):
         '''
 
         ############ ADD YOUR CODE HERE ############
+        if self.cv_image is None:
+            return
 
+        center_ore_list, ore_type_list = detect_ores(self.cv_image)
+
+        print("Centers:", center_ore_list)
+        print("Types:", ore_type_list)
+
+        for (u, v), ore_label in zip(center_ore_list, ore_type_list):
+            if self.depth_image is None:
+                continue
+            patch = self.depth_image[v-4:v+5, u-4:u+5]
+            z  = np.median(patch[np.isfinite(patch) & (patch > 0.0)])
+            x = (u - self.cx) * z / self.fx
+            y = (v - self.cy) * z / self.fy
+            
+
+            point_in_camera = PointStamped()
+            point_in_camera.header.frame_id = 'camera_color_optical_frame'
+            point_in_camera.point.x = x
+            point_in_camera.point.y = y
+            point_in_camera.point.z = z
+
+            tf = self.tf_buffer.lookup_transform(base_frame, 
+                                'camera_color_optical_frame', 
+                                rclpy.time.Time())
+            p  = do_transform_point(point_in_camera, tf)
+        
+            frame_id = 'base_link'
+            child_frame_id = ore_label
+            t = TransformStamped()
+            t.header.stamp = self.get_clock().now().to_msg()
+            t.header.frame_id = frame_id
+            t.child_frame_id = child_frame_id
+            t.transform.translation.x = float(p.point.x)
+            t.transform.translation.y = float(p.point.y)
+            t.transform.translation.z = float(p.point.z)
+            t.transform.rotation.w = 1.0
+            self.br.sendTransform(t)
+
+    
         # INSTRUCTIONS & HELP :
 
         #	->  Return early until both images and the camera info have arrived.
