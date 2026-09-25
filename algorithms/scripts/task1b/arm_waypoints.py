@@ -30,7 +30,8 @@
 
 
 ################### IMPORT MODULES #######################
-
+from scipy.spatial.transform import Rotation
+import numpy as np
 import rclpy
 import sys
 import math
@@ -79,6 +80,11 @@ cap_joint_rps = 0.35      # per joint
 # Dead-man switch: the arm stops this long after the last message it received.
 command_timeout_s = 0.15
 
+def cap(v, limit):
+    norm = math.sqrt(sum(x**2 for x in v))
+    if norm > limit:
+        v = [x * (limit / norm) for x in v]
+    return v
 
 ##################### CLASS DEFINITION #######################
 
@@ -123,6 +129,21 @@ class arm_waypoints(Node):
         self.tcp_pose = None                                                            # tool pose variable (from tcpposecb())
         self.joint_angles = None                                                        # joint feedback variable (from jointstatecb())
         self.arm_status = None                                                          # arm state code variable (from armstatuscb())
+        self.active_controller = None
+        self.current_wp = 0
+        self.arrival_time = None
+        self.cruise_speed = 0.10
+        self.phase = 'unfold'  
+        self.elbow_target = None
+        self.switch_controller(twist_controller)
+        self.base_home = [
+            0.0,
+            -0.5235989992238703,
+            -2.44346100157454,
+            -0.17453300287162465,
+            1.5707959999999992,
+            1.5707959998303753
+        ]
 
         ############ ADD YOUR CODE HERE ############
 
@@ -144,7 +165,7 @@ class arm_waypoints(Node):
 
         Returns:
         '''
-
+        self.tcp_pose = data.pose.position,data.pose.orientation
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
@@ -169,6 +190,7 @@ class arm_waypoints(Node):
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
+        self.joint_angles = [data.position[data.name.index(j)] for j in joint_names]
 
         #	->  Store the joint angles, matched BY NAME - the order is not promised.
         #       ->  HINT: angles = [data.position[data.name.index(j)] for j in joint_names]
@@ -190,7 +212,7 @@ class arm_waypoints(Node):
         '''
 
         ############ ADD YOUR CODE HERE ############
-
+        self.arm_status = data.data
         # INSTRUCTIONS & HELP :
 
         #	->  Store the code, and log it while you are developing. Zero is healthy; anything
@@ -215,6 +237,24 @@ class arm_waypoints(Node):
         '''
 
         ############ ADD YOUR CODE HERE ############
+        req = SwitchController.Request()
+
+        if controller == twist_controller:
+            self.active_controller = twist_controller
+            req.activate_controllers = [twist_controller]
+            req.deactivate_controllers = [joint_controller]
+        elif controller == joint_controller:
+            self.active_controller = joint_controller
+            req.activate_controllers = [joint_controller]
+            req.deactivate_controllers = [twist_controller]
+
+        req.strictness = SwitchController.Request.STRICT
+        self.switch_cli.wait_for_service(timeout_sec=20.0)
+        future = self.switch_cli.call_async(req)
+        if future.done():
+            response = future.result()
+        else:
+            return
 
         # INSTRUCTIONS & HELP :
 
@@ -236,7 +276,7 @@ class arm_waypoints(Node):
 
         ############################################
 
-
+    
     def process_waypoints(self):
         '''
         Description:    Timer function used to drive the tool through the waypoints.
@@ -244,8 +284,116 @@ class arm_waypoints(Node):
         Args:
         Returns:
         '''
+        if self.tcp_pose is None or self.joint_angles is None or self.arm_status is None:
+            return
+        if self.current_wp >= len(waypoints):
+            return 
+
+        if self.phase == 'unfold':
+            if self.elbow_target is None:
+                target_deg = -(90 + 45 * self.current_wp) 
+                self.elbow_target = self.base_home[0] + math.radians(target_deg)
+                self.switch_controller(joint_controller)
+
+            raw_error = self.elbow_target - self.joint_angles[0]
+            base_error = math.atan2(
+                math.sin(raw_error),
+                math.cos(raw_error)
+            )
+            if abs(base_error) < math.radians(2):
+                self.phase = 'cartesian'
+                self.elbow_target = None
+                self.switch_controller(twist_controller)
+                return
+            vel = max(-cap_joint_rps, min(cap_joint_rps, base_error))
+            msg = JointJog()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.joint_names = joint_names
+
+            msg.velocities = [vel, 0.0, 0.0, 0.0, 0.0, 0.0]
+            self.joint_pub.publish(msg)
+            return
+
+
+        if self.phase == 'return_home':
+            if self.active_controller != joint_controller:
+                self.switch_controller(joint_controller)
+
+            home_error = np.array(self.base_home) - np.array(self.joint_angles)
+
+            if np.max(np.abs(home_error)) < math.radians(2):
+                if self.current_wp >= len(waypoints):
+                    self.phase = 'done'
+                else:
+                    self.phase = 'unfold'
+                self.current_wp += 1
+                return
+
+
+            velocities = np.clip(
+                home_error,
+                -cap_joint_rps,
+                cap_joint_rps
+            )
+
+            msg = JointJog()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.joint_names = joint_names
+            msg.velocities = velocities.tolist()
+
+            self.joint_pub.publish(msg)
+            return
+
+
 
         ############ ADD YOUR CODE HERE ############
+        current_pos,current_orien = self.tcp_pose
+        kp = 1.0
+        target = waypoints[self.current_wp]
+        error = np.array(target) - np.array([current_pos.x, current_pos.y, current_pos.z])
+        distance = np.linalg.norm(error)
+        # print("Distance:",distance)
+        
+        cruise_speed = self.cruise_speed
+        if self.arm_status != 0:
+            cruise_speed *= 0.3
+        if distance < 0.05:
+            if self.arrival_time is None:
+                self.arrival_time = self.get_clock().now()
+            elif (self.get_clock().now() - self.arrival_time).nanoseconds > 2e9:
+                
+                self.arrival_time = None
+                self.phase = 'return_home'
+            return
+        
+        else:
+            self.arrival_time = None
+            direction = error / distance
+            speed = min(cruise_speed, kp*distance)
+            
+            b = np.array([0.0, 0.0, -1.0])
+            a = Rotation.from_quat([current_orien.x,current_orien.y,current_orien.z,current_orien.w]).as_matrix()[:,2]
+            c = np.cross(a,b)
+            norm_c = np.linalg.norm(c)
+            if norm_c < 1e-8:
+                omega = np.zeros(3)
+            else:
+                e = c / norm_c * np.arctan2(norm_c, np.dot(a, b))
+                omega = kp * e
+            omega = cap(omega, cap_angular_rps * 0.95)
+            capped_v = cap((speed * direction).tolist(), cap_linear_mps)
+            msg = TwistStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = base_frame
+            msg.twist.linear.x = capped_v[0]
+            msg.twist.linear.y = capped_v[1]
+            msg.twist.linear.z = capped_v[2]
+            msg.twist.angular.x = omega[0]
+            msg.twist.angular.y = omega[1]
+            msg.twist.angular.z = omega[2]
+            print("Publishing:",speed * direction)
+            self.twist_pub.publish(msg)
+                    
 
         # INSTRUCTIONS & HELP :
 
